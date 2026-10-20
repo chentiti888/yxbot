@@ -1,402 +1,428 @@
 #!/usr/bin/env python3
+# 单文件 Telegram 猜数字机器人
+# 依赖：python-telegram-bot 22.x
+# 可直接修改下方 BOT_TOKEN / ADMIN_ID，也可通过环境变量 BOT_TOKEN / ADMIN_ID 配置。
+# 首次运行会自动创建同目录下的 guess_bot.sqlite3，用于保存积分和设置。
+
 import os
 import random
 import sqlite3
 import logging
-from datetime import datetime, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from pathlib import Path
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
-DB_PATH = os.environ.get("DB_PATH", "/opt/tg-guess-bot/data.sqlite3")
-INITIAL_POINTS = int(os.environ.get("INITIAL_POINTS", "1000"))
-MIN_BET = int(os.environ.get("MIN_BET", "10"))
-MAX_BET = int(os.environ.get("MAX_BET", "1000"))
-if not BOT_TOKEN:
-    raise SystemExit("缺少 BOT_TOKEN 环境变量")
-if not ADMIN_ID_RAW.isdigit():
-    raise SystemExit("缺少有效的 ADMIN_ID 环境变量")
-ADMIN_ID = int(ADMIN_ID_RAW)
+# ===== 只需要配置这里 =====
+BOT_TOKEN = os.getenv("BOT_TOKEN", "把新机器人的BotFather Token填在这里")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # 填你的 Telegram 数字用户 ID
+# ==========================
+
+START_POINTS = 1000
+MIN_BET = 10
+BET_OPTIONS = (10, 50, 100, 200)
+WIN_MULTIPLIER = 2.8  # 猜中后返还总额 = 下注 × 倍数（含本金）
+DB_PATH = Path(__file__).resolve().with_name("guess_bot.sqlite3")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("guess-bot")
 
-os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA busy_timeout=30000")
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS users (
-  user_id INTEGER PRIMARY KEY,
-  username TEXT NOT NULL DEFAULT '',
-  points INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS rounds (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  guess INTEGER NOT NULL,
-  result INTEGER NOT NULL,
-  bet INTEGER NOT NULL,
-  payout INTEGER NOT NULL,
-  balance_after INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-""")
-conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('game_enabled','1')")
-conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('probabilities','34,33,33')")
-conn.commit()
 
-def now():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
-def get_setting(key, default=""):
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
 
-def set_setting(key, value):
-    conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                 (key, str(value)))
-    conn.commit()
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                points INTEGER NOT NULL DEFAULT 1000,
+                played INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO settings(key, value)
+            VALUES ('probabilities', '34,33,33')
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO settings(key, value)
+            VALUES ('game_on', '1')
+        """)
+
+
+def get_settings(conn):
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='probabilities'"
+    ).fetchone()
+    probs = [int(x) for x in row["value"].split(",")]
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='game_on'"
+    ).fetchone()
+    return probs, row["value"] == "1"
+
 
 def ensure_user(user):
-    username = user.username or user.full_name or ""
-    conn.execute(
-        "INSERT OR IGNORE INTO users(user_id,username,points,created_at) VALUES(?,?,?,?)",
-        (user.id, username, INITIAL_POINTS, now())
-    )
-    conn.execute("UPDATE users SET username=? WHERE user_id=?", (username, user.id))
-    conn.commit()
+    with db() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO users(user_id, username, points)
+               VALUES (?, ?, ?)""",
+            (user.id, user.username or user.full_name or "", START_POINTS),
+        )
+        conn.execute(
+            "UPDATE users SET username=? WHERE user_id=?",
+            (user.username or user.full_name or "", user.id),
+        )
+        row = conn.execute(
+            "SELECT points, played, wins FROM users WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+    return row
 
-def balance(user_id):
-    row = conn.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return int(row["points"]) if row else 0
-
-def enabled():
-    return get_setting("game_enabled", "1") == "1"
-
-def probabilities():
-    try:
-        vals = [int(x) for x in get_setting("probabilities", "34,33,33").split(",")]
-        if len(vals) == 3 and all(x >= 0 for x in vals) and sum(vals) == 100:
-            return vals
-    except Exception:
-        pass
-    return [34, 33, 33]
-
-def draw_number():
-    # The configured probabilities are shown to players in /rules.
-    return random.choices([1, 2, 3], weights=probabilities(), k=1)[0]
 
 def main_keyboard():
+    rows = [
+        [InlineKeyboardButton(f"下注 {amount} 积分", callback_data=f"bet:{amount}")
+         for amount in BET_OPTIONS[:2]],
+        [InlineKeyboardButton(f"下注 {amount} 积分", callback_data=f"bet:{amount}")
+         for amount in BET_OPTIONS[2:]],
+        [InlineKeyboardButton("我的积分", callback_data="balance"),
+         InlineKeyboardButton("游戏规则", callback_data="rules")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def guess_keyboard(amount):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎲 开始猜数字", callback_data="play"),
-         InlineKeyboardButton("💰 我的积分", callback_data="balance")],
-        [InlineKeyboardButton("📜 游戏规则", callback_data="rules"),
-         InlineKeyboardButton("🏆 排行榜", callback_data="rank")],
-        [InlineKeyboardButton("🧾 最近记录", callback_data="history")]
+        [InlineKeyboardButton("猜 1", callback_data=f"guess:{amount}:1"),
+         InlineKeyboardButton("猜 2", callback_data=f"guess:{amount}:2"),
+         InlineKeyboardButton("猜 3", callback_data=f"guess:{amount}:3")],
+        [InlineKeyboardButton("返回下注", callback_data="home")],
     ])
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+
+def rules_text():
+    return (
+        "🎮 猜数字规则\n\n"
+        "1. 先选择下注积分，再猜 1、2 或 3。\n"
+        f"2. 猜中返还下注的 {WIN_MULTIPLIER:g} 倍（包含本金）；猜错扣除下注。\n"
+        f"3. 最低下注 {MIN_BET} 积分；可选下注："
+        + "、".join(map(str, BET_OPTIONS))
+        + "。\n"
+        "4. 积分仅为游戏内虚拟积分，不支持充值或提现。\n"
+        "5. 开奖概率由管理员设置，可用 /prob 查看。"
+    )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user)
+    row = ensure_user(user)
     text = (
-        "🎲 <b>猜数字小游戏</b>\n\n"
-        f"欢迎你，{user.first_name or '玩家'}！\n"
-        f"当前积分：<b>{balance(user.id)}</b>\n\n"
-        "选择 1、2、3 中的一个数字，设置下注积分，立即开奖。\n"
-        "本机器人仅使用虚拟积分，不支持充值或提现。"
+        f"🎲 欢迎来到猜数字！\n\n"
+        f"当前积分：{row['points']}\n"
+        "先选择下注金额，再猜一个数字。"
     )
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=main_keyboard())
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard())
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = ensure_user(update.effective_user)
+    text = (
+        f"👤 用户：{update.effective_user.full_name}\n"
+        f"🪙 当前积分：{row['points']}\n"
+        f"🎮 已玩局数：{row['played']}\n"
+        f"🏆 猜中局数：{row['wins']}"
+    )
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard())
+
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    p = probabilities()
-    await update.effective_message.reply_text(
-        "📜 <b>游戏规则</b>\n\n"
-        "1. 每次选择数字 1、2、3 之一。\n"
-        f"2. 每次下注范围：{MIN_BET}–{MAX_BET} 积分。\n"
-        "3. 猜中数字 1/2/3，分别返还下注额的 1/2/3 倍（含本金）。\n"
-        "4. 猜错则扣除本次下注。\n"
-        f"5. 当前开奖概率：数字1 {p[0]}% / 数字2 {p[1]}% / 数字3 {p[2]}%。\n"
-        "6. 这是虚拟积分娱乐测试，不涉及充值、提现或现金兑换。",
-        parse_mode="HTML", reply_markup=main_keyboard()
-    )
+    await update.effective_message.reply_text(rules_text(), reply_markup=main_keyboard())
 
-async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    await update.effective_message.reply_text(
-        f"💰 你的积分余额：<b>{balance(user.id)}</b>",
-        parse_mode="HTML", reply_markup=main_keyboard()
-    )
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    ensure_user(user)
-    if q.data == "balance":
-        await q.edit_message_text(
-            f"💰 你的积分余额：<b>{balance(user.id)}</b>",
-            parse_mode="HTML", reply_markup=main_keyboard()
-        )
-    elif q.data == "rules":
-        p = probabilities()
-        await q.edit_message_text(
-            "📜 <b>游戏规则</b>\n\n"
-            f"下注范围：{MIN_BET}–{MAX_BET} 积分\n"
-            "猜中 1/2/3 分别返还下注额的 1/2/3 倍（含本金）；猜错扣除下注。\n"
-            f"当前开奖概率：1={p[0]}%，2={p[1]}%，3={p[2]}%。\n"
-            "仅供虚拟积分测试，不支持充值或提现。",
-            parse_mode="HTML", reply_markup=main_keyboard()
-        )
-    elif q.data == "play":
-        if not enabled():
-            await q.edit_message_text("⛔ 游戏暂时关闭。", reply_markup=main_keyboard())
-            return
-        context.user_data.pop("guess", None)
-        await q.edit_message_text(
-            f"🎯 请选择数字：\n当前积分：{balance(user.id)}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("1️⃣ 数字 1（1倍）", callback_data="guess:1"),
-                InlineKeyboardButton("2️⃣ 数字 2（2倍）", callback_data="guess:2"),
-                InlineKeyboardButton("3️⃣ 数字 3（3倍）", callback_data="guess:3")
-            ], [InlineKeyboardButton("返回菜单", callback_data="menu")]])
-        )
-    elif q.data.startswith("guess:"):
-        if not enabled():
-            await q.edit_message_text("⛔ 游戏暂时关闭。", reply_markup=main_keyboard())
-            return
-        guess = int(q.data.split(":")[1])
-        context.user_data["guess"] = guess
-        await q.edit_message_text(
-            f"你选择了数字 <b>{guess}</b>。\n请输入下注积分（{MIN_BET}–{MAX_BET} 的整数）。\n"
-            f"当前余额：{balance(user.id)}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消", callback_data="menu")]])
-        )
-        context.user_data["await_bet"] = True
-    elif q.data == "history":
-        rows = conn.execute(
-            "SELECT guess,result,bet,payout,balance_after,created_at FROM rounds WHERE user_id=? ORDER BY id DESC LIMIT 10",
-            (user.id,)
-        ).fetchall()
-        if not rows:
-            msg = "你还没有游戏记录。"
-        else:
-            lines = ["🧾 <b>最近 10 次记录</b>"]
-            for r in rows:
-                outcome = "中奖" if r["payout"] > 0 else "未中"
-                lines.append(f"猜{r['guess']} / 开{r['result']} · 下注{r['bet']} · 返还{r['payout']} · {outcome}")
-            msg = "\n".join(lines)
-        await q.edit_message_text(msg, parse_mode="HTML", reply_markup=main_keyboard())
-    elif q.data == "rank":
-        rows = conn.execute(
-            "SELECT username,points FROM users ORDER BY points DESC LIMIT 10"
-        ).fetchall()
-        lines = ["🏆 <b>积分排行榜</b>"]
-        for i, r in enumerate(rows, 1):
-            name = (r["username"] or "玩家").replace("<", "").replace(">", "")
-            lines.append(f"{i}. {name} — {r['points']} 积分")
-        await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard())
-    elif q.data == "menu":
-        context.user_data.pop("await_bet", None)
-        context.user_data.pop("guess", None)
-        await q.edit_message_text("主菜单：", reply_markup=main_keyboard())
-
-async def handle_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("await_bet"):
-        return
-    user = update.effective_user
-    ensure_user(user)
-    raw = (update.effective_message.text or "").strip()
-    if not raw.isdigit():
-        await update.effective_message.reply_text(f"请输入整数下注额（{MIN_BET}–{MAX_BET}）。")
-        return
-    bet = int(raw)
-    if bet < MIN_BET or bet > MAX_BET:
-        await update.effective_message.reply_text(f"下注范围是 {MIN_BET}–{MAX_BET} 积分，请重新输入。")
-        return
-    guess = context.user_data.get("guess")
-    if guess not in (1, 2, 3):
-        context.user_data["await_bet"] = False
-        await update.effective_message.reply_text("本次选择已失效，请重新开始。", reply_markup=main_keyboard())
-        return
-    if not enabled():
-        context.user_data["await_bet"] = False
-        await update.effective_message.reply_text("游戏暂时关闭。", reply_markup=main_keyboard())
-        return
-
-    # Atomic balance check/debit/settlement avoids double spending.
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT points FROM users WHERE user_id=?", (user.id,)).fetchone()
-        current = int(row["points"]) if row else 0
-        if current < bet:
-            conn.rollback()
-            await update.effective_message.reply_text(
-                f"积分不足。当前余额 {current}，本次下注 {bet}。",
-                reply_markup=main_keyboard()
-            )
-            return
-        result = draw_number()
-        payout = bet * guess if guess == result else 0
-        new_balance = current - bet + payout
-        conn.execute("UPDATE users SET points=?,username=? WHERE user_id=?",
-                     (new_balance, user.username or user.full_name or "", user.id))
-        conn.execute(
-            "INSERT INTO rounds(user_id,guess,result,bet,payout,balance_after,created_at) VALUES(?,?,?,?,?,?,?)",
-            (user.id, guess, result, bet, payout, new_balance, now())
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        log.exception("settlement failed")
-        await update.effective_message.reply_text("结算失败，请稍后再试；未确认前不要重复提交。")
-        return
-    finally:
-        context.user_data["await_bet"] = False
-        context.user_data.pop("guess", None)
-
-    if guess == result:
-        net = payout - bet
-        result_text = f"🎉 <b>猜中了！</b>\n开奖结果：{result}\n返还：{payout} 积分\n本次净收益：+{net} 积分"
-    else:
-        result_text = f"😅 <b>没猜中</b>\n你猜：{guess}\n开奖结果：{result}\n本次损失：{bet} 积分"
-    await update.effective_message.reply_text(
-        f"{result_text}\n\n💰 当前余额：<b>{new_balance}</b>",
-        parse_mode="HTML", reply_markup=main_keyboard()
-    )
 
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if update.effective_user.id != ADMIN_ID:
         await update.effective_message.reply_text("无权限。")
         return
     await update.effective_message.reply_text(
-        "🛠 管理员命令：\n"
-        "/prob 34 33 33 — 设置数字1/2/3概率，总和必须100\n"
+        "管理员命令：\n"
+        "/prob 34 33 33 — 设置 1/2/3 的开奖概率，总和必须为 100\n"
+        "/prob — 查看当前概率\n"
         "/addpoints 用户ID 数量 — 增加积分\n"
         "/setpoints 用户ID 数量 — 设置积分\n"
         "/game_on — 开启游戏\n"
         "/game_off — 关闭游戏\n"
-        "/stats — 查看统计\n"
-        "/admin — 显示本帮助"
+        "/stats — 查看统计"
     )
 
-async def admin_prob(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.effective_message.reply_text("无权限。")
-    try:
-        vals = [int(x) for x in context.args]
-        if len(vals) != 3 or any(x < 0 for x in vals) or sum(vals) != 100:
-            raise ValueError()
-        set_setting("probabilities", ",".join(map(str, vals)))
-        await update.effective_message.reply_text(
-            f"已设置开奖概率：数字1 {vals[0]}%，数字2 {vals[1]}%，数字3 {vals[2]}%。\n"
-            "此设置会显示在玩家游戏规则中。"
-        )
-    except ValueError:
-        await update.effective_message.reply_text("格式：/prob 34 33 33（总和必须为100）")
 
-async def admin_points(update: Update, context: ContextTypes.DEFAULT_TYPE, set_mode=False):
-    if not is_admin(update.effective_user.id):
-        return await update.effective_message.reply_text("无权限。")
+async def prob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("无权限。")
+        return
+    with db() as conn:
+        if len(context.args) == 0:
+            probs, _ = get_settings(conn)
+            await update.effective_message.reply_text(
+                f"当前开奖概率：1={probs[0]}%，2={probs[1]}%，3={probs[2]}%"
+            )
+            return
+        if len(context.args) != 3:
+            await update.effective_message.reply_text("用法：/prob 34 33 33")
+            return
+        try:
+            probs = [int(x) for x in context.args]
+        except ValueError:
+            await update.effective_message.reply_text("概率必须是整数。")
+            return
+        if any(x < 0 or x > 100 for x in probs) or sum(probs) != 100:
+            await update.effective_message.reply_text("三个概率必须在 0–100 之间，且总和为 100。")
+            return
+        conn.execute(
+            "UPDATE settings SET value=? WHERE key='probabilities'",
+            (",".join(map(str, probs)),),
+        )
+    await update.effective_message.reply_text(
+        f"已设置开奖概率：1={probs[0]}%，2={probs[1]}%，3={probs[2]}%"
+    )
+
+
+async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    if update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("无权限。")
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text(
+            f"用法：/{mode} 用户ID 数量"
+        )
+        return
     try:
-        uid, amount = int(context.args[0]), int(context.args[1])
-        if amount < 0 or amount > 10**9:
-            raise ValueError()
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT points FROM users WHERE user_id=?", (uid,)).fetchone()
-        if not row:
-            conn.rollback()
-            return await update.effective_message.reply_text("找不到该用户。用户需先 /start。")
-        if set_mode:
-            new = amount
-        else:
-            new = int(row["points"]) + amount
-        conn.execute("UPDATE users SET points=? WHERE user_id=?", (new, uid))
-        conn.commit()
-        await update.effective_message.reply_text(f"已更新用户 {uid} 的积分：{new}")
-    except (ValueError, IndexError):
-        await update.effective_message.reply_text("格式：/addpoints 用户ID 数量 或 /setpoints 用户ID 数量")
-    except Exception:
-        conn.rollback()
-        log.exception("admin points failed")
-        await update.effective_message.reply_text("操作失败。")
+        target_id = int(context.args[0])
+        amount = int(context.args[1])
+    except ValueError:
+        await update.effective_message.reply_text("用户 ID 和数量必须是整数。")
+        return
+    if amount < 0 or (mode == "addpoints" and amount == 0):
+        await update.effective_message.reply_text("数量不正确。")
+        return
+    with db() as conn:
+        row = conn.execute(
+            "SELECT points FROM users WHERE user_id=?", (target_id,)
+        ).fetchone()
+        if row is None:
+            await update.effective_message.reply_text(
+                "数据库里还没有这个用户。请让对方先发送 /start。"
+            )
+            return
+        new_points = amount if mode == "setpoints" else row["points"] + amount
+        conn.execute(
+            "UPDATE users SET points=? WHERE user_id=?",
+            (new_points, target_id),
+        )
+    await update.effective_message.reply_text(
+        f"已处理用户 {target_id} 的积分，当前积分：{new_points}"
+    )
+
 
 async def addpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await admin_points(update, context, False)
+    await points_command(update, context, "addpoints")
+
 
 async def setpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await admin_points(update, context, True)
+    await points_command(update, context, "setpoints")
+
+
+async def game_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, enabled: bool):
+    if update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("无权限。")
+        return
+    with db() as conn:
+        conn.execute(
+            "UPDATE settings SET value=? WHERE key='game_on'",
+            ("1" if enabled else "0",),
+        )
+    await update.effective_message.reply_text("游戏已开启。" if enabled else "游戏已关闭。")
+
 
 async def game_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.effective_message.reply_text("无权限。")
-    set_setting("game_enabled", "1")
-    await update.effective_message.reply_text("游戏已开启。")
+    await game_toggle(update, context, True)
+
 
 async def game_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.effective_message.reply_text("无权限。")
-    set_setting("game_enabled", "0")
-    await update.effective_message.reply_text("游戏已关闭。")
+    await game_toggle(update, context, False)
+
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return await update.effective_message.reply_text("无权限。")
-    users = conn.execute("SELECT COUNT(*) n, COALESCE(SUM(points),0) p FROM users").fetchone()
-    rounds = conn.execute("SELECT COUNT(*) n, COALESCE(SUM(bet),0) b, COALESCE(SUM(payout),0) p FROM rounds").fetchone()
-    p = probabilities()
+    if update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_text("无权限。")
+        return
+    with db() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS users, COALESCE(SUM(points), 0) AS points,
+                   COALESCE(SUM(played), 0) AS played,
+                   COALESCE(SUM(wins), 0) AS wins
+            FROM users
+        """).fetchone()
+        probs, enabled = get_settings(conn)
     await update.effective_message.reply_text(
-        f"用户数：{users['n']}\n积分总余额：{users['p']}\n"
-        f"总局数：{rounds['n']}\n累计下注：{rounds['b']}\n累计返还：{rounds['p']}\n"
-        f"概率：1={p[0]}% / 2={p[1]}% / 3={p[2]}%\n"
-        f"游戏状态：{'开启' if enabled() else '关闭'}"
+        f"📊 游戏统计\n用户数：{row['users']}\n"
+        f"积分总额：{row['points']}\n总局数：{row['played']}\n"
+        f"猜中局数：{row['wins']}\n游戏状态：{'开启' if enabled else '关闭'}\n"
+        f"开奖概率：{probs[0]}% / {probs[1]}% / {probs[2]}%"
     )
 
-async def main():
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    row = ensure_user(user)
+    data = query.data or ""
+
+    if data == "home":
+        await query.edit_message_text(
+            f"🎲 猜数字\n当前积分：{row['points']}\n请选择下注金额。",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if data == "balance":
+        await query.edit_message_text(
+            f"🪙 当前积分：{row['points']}\n已玩局数：{row['played']}\n"
+            f"猜中局数：{row['wins']}",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if data == "rules":
+        await query.edit_message_text(rules_text(), reply_markup=main_keyboard())
+        return
+
+    if data.startswith("bet:"):
+        try:
+            amount = int(data.split(":")[1])
+        except (ValueError, IndexError):
+            return
+        if amount not in BET_OPTIONS:
+            await query.edit_message_text("下注金额无效。", reply_markup=main_keyboard())
+            return
+        with db() as conn:
+            _, enabled = get_settings(conn)
+        if not enabled:
+            await query.edit_message_text("游戏暂时关闭，请稍后再来。", reply_markup=main_keyboard())
+            return
+        if row["points"] < amount:
+            await query.edit_message_text(
+                f"积分不足。你有 {row['points']} 积分。",
+                reply_markup=main_keyboard(),
+            )
+            return
+        await query.edit_message_text(
+            f"本局下注：{amount} 积分\n请选择你猜的数字：",
+            reply_markup=guess_keyboard(amount),
+        )
+        return
+
+    if data.startswith("guess:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        try:
+            amount, guess = int(parts[1]), int(parts[2])
+        except ValueError:
+            return
+        if amount not in BET_OPTIONS or guess not in (1, 2, 3):
+            await query.edit_message_text("本次操作无效。", reply_markup=main_keyboard())
+            return
+
+        # 事务中重新读取积分和设置，防止连续点击导致重复下注。
+        with db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            user_row = conn.execute(
+                "SELECT points FROM users WHERE user_id=?", (user.id,)
+            ).fetchone()
+            probs, enabled = get_settings(conn)
+            if not enabled:
+                conn.rollback()
+                await query.edit_message_text("游戏暂时关闭。", reply_markup=main_keyboard())
+                return
+            if user_row is None or user_row["points"] < amount:
+                conn.rollback()
+                current = 0 if user_row is None else user_row["points"]
+                await query.edit_message_text(
+                    f"积分不足，当前积分：{current}",
+                    reply_markup=main_keyboard(),
+                )
+                return
+
+            # 先扣下注；开奖概率由管理员设置。
+            result = random.choices((1, 2, 3), weights=probs, k=1)[0]
+            new_points = user_row["points"] - amount
+            won = result == guess
+            payout = int(amount * WIN_MULTIPLIER) if won else 0
+            new_points += payout
+            conn.execute(
+                "UPDATE users SET points=?, played=played+1, wins=wins+? WHERE user_id=?",
+                (new_points, 1 if won else 0, user.id),
+            )
+            conn.commit()
+
+        if won:
+            result_text = (
+                f"🎉 猜中了！开奖结果：{result}\n"
+                f"下注：{amount}\n返还：{payout}（含本金）\n"
+                f"本局净赚：{payout - amount}\n剩余积分：{new_points}"
+            )
+        else:
+            result_text = (
+                f"😅 没猜中，开奖结果：{result}\n"
+                f"本局扣除：{amount}\n剩余积分：{new_points}"
+            )
+        await query.edit_message_text(result_text, reply_markup=main_keyboard())
+        return
+
+
+def main():
+    if not BOT_TOKEN or BOT_TOKEN == "把新机器人的BotFather Token填在这里":
+        raise SystemExit("请先在 app.py 顶部填写独立机器人的 BOT_TOKEN。")
+    if ADMIN_ID <= 0:
+        raise SystemExit("请先在 app.py 顶部填写你的 Telegram 数字用户 ID（ADMIN_ID）。")
+    init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("balance", show_balance))
     app.add_handler(CommandHandler("admin", admin_help))
-    app.add_handler(CommandHandler("prob", admin_prob))
+    app.add_handler(CommandHandler("prob", prob_command))
     app.add_handler(CommandHandler("addpoints", addpoints))
     app.add_handler(CommandHandler("setpoints", setpoints))
     app.add_handler(CommandHandler("game_on", game_on))
     app.add_handler(CommandHandler("game_off", game_off))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_bet))
-    log.info("猜数字机器人启动，数据库：%s", DB_PATH)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=False)
-    try:
-        import asyncio
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    app.add_handler(CallbackQueryHandler(button_handler))
+    log.info("Guess bot starting.")
+    app.run_polling(drop_pending_updates=False)
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
