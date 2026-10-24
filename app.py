@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 单文件 Telegram 猜数字机器人
-# 依赖：python-telegram-bot 22.xx
+# 依赖：python-telegram-bot 22.x
 # 可直接修改下方 BOT_TOKEN / ADMIN_ID，也可通过环境变量 BOT_TOKEN / ADMIN_ID 配置。
 # 首次运行会自动创建同目录下的 guess_bot.sqlite3，用于保存积分和设置。
 
